@@ -171,20 +171,43 @@ def reserve_target(dst_dir: str, stem: str, ext: str, claimed: set[str]) -> str:
     return cand
 
 
-def existing_target_matches_move(src: str, dst: str) -> bool:
-    """For ACTION_MOVE: dst is acceptable as a resume-skip if size matches src."""
+# Filesystem mtime resolution can be as coarse as 2s on FAT/exFAT, so allow
+# that much slack when matching a resume target back to its source.
+_MTIME_TOLERANCE_NS = 2_000_000_000
+
+
+def _mtime_matches(src: str, dst: str) -> bool:
     try:
-        return os.path.getsize(src) == os.path.getsize(dst)
+        s_ns = os.stat(src).st_mtime_ns
+        d_ns = os.stat(dst).st_mtime_ns
     except OSError:
         return False
+    return abs(s_ns - d_ns) <= _MTIME_TOLERANCE_NS
 
 
-def existing_target_matches_convert(dst: str) -> bool:
-    """For converts/rewraps: dst is acceptable if non-empty and ffprobe-decodable."""
+def existing_target_matches_move(src: str, dst: str) -> bool:
+    """For ACTION_MOVE: dst is a resume-skip if its size and mtime match src.
+    The mtime check is what makes this binding to *this* source rather than to
+    an unrelated file that happens to share the stem."""
+    try:
+        if os.path.getsize(src) != os.path.getsize(dst):
+            return False
+    except OSError:
+        return False
+    return _mtime_matches(src, dst)
+
+
+def existing_target_matches_convert(src: str, dst: str) -> bool:
+    """For converts/rewraps: dst is a resume-skip if it's non-empty,
+    ffprobe-decodable, and its mtime matches src (copy_mtime is called after
+    every successful convert, so a dst produced by a prior run for *this*
+    source carries src's mtime)."""
     try:
         if os.path.getsize(dst) == 0:
             return False
     except OSError:
+        return False
+    if not _mtime_matches(src, dst):
         return False
     _, ok, _ = ffprobe_full(dst)
     return ok
@@ -376,8 +399,10 @@ def execute_job(job: Job, dst: str, mp3_quality: str, verify: bool,
     try:
         os.remove(job.src)
     except OSError as e:
-        # Conversion succeeded; we just couldn't drop the source.
-        return Result(job, dst, "failed", bo, f"post-rm failed: {e}")
+        # Conversion succeeded and was verified; only source cleanup failed.
+        # Report as ok so the summary doesn't lie, with a note flagging the
+        # leftover source for the operator.
+        return Result(job, dst, "ok", bo, f"src not removed: {e}")
 
     return Result(job, dst, "ok", bo)
 
@@ -432,11 +457,12 @@ class ProgressRenderer:
             self.in_flight[src] = frac
         self._render()
 
-    def finish_file(self, src: str, bytes_in: int) -> None:
+    def finish_file(self, src: str, bytes_in: int, succeeded: bool) -> None:
         with self.lock:
             self.in_flight.pop(src, None)
             self.done_count += 1
-            self.done_bytes += bytes_in
+            if succeeded:
+                self.done_bytes += bytes_in
         self._render(force=True)
 
     def _bar(self, frac: float, w: int) -> str:
@@ -560,7 +586,9 @@ def main(argv: list[str] | None = None) -> int:
         ext = Path(p).suffix.lower()
         target_ext = target_ext_for(action, ext)
         dur = 0.0
-        if action != ACTION_MOVE:
+        # Duration only feeds the per-file progress bar denominator; dry-run
+        # never renders one, so skip the (slow) probe in that mode.
+        if action != ACTION_MOVE and not args.dry_run:
             dur, _, _ = ffprobe_full(p)
         jobs.append(Job(src=p, action=action, target_ext=target_ext,
                         size=sz, duration=dur))
@@ -573,19 +601,23 @@ def main(argv: list[str] | None = None) -> int:
     runnable: list[tuple[Job, str]] = []
     for job in jobs:
         # First, see if any matching dst already exists from a previous run
-        # we can resume from. We probe dst variants in order.
+        # we can resume from. Iterate stem, stem_1, stem_2, ... until we hit
+        # the first slot that's neither claimed nor present on disk — past
+        # that point reserve_target would have allocated a fresh name, so
+        # nothing further could possibly match.
         resume_dst = None
-        base = os.path.join(dst, f"{job.stem}.{job.target_ext}")
-        candidates = [base] + [
-            os.path.join(dst, f"{job.stem}_{i}.{job.target_ext}")
-            for i in range(1, 32)
-        ]
-        for cand in candidates:
-            if cand in claimed or not os.path.exists(cand):
+        i = 0
+        while True:
+            cand = (os.path.join(dst, f"{job.stem}.{job.target_ext}") if i == 0
+                    else os.path.join(dst, f"{job.stem}_{i}.{job.target_ext}"))
+            i += 1
+            if cand in claimed:
                 continue
+            if not os.path.exists(cand):
+                break
             ok = (existing_target_matches_move(job.src, cand)
                   if job.action == ACTION_MOVE
-                  else existing_target_matches_convert(cand))
+                  else existing_target_matches_convert(job.src, cand))
             if ok:
                 resume_dst = cand
                 break
@@ -625,16 +657,19 @@ def main(argv: list[str] | None = None) -> int:
 
     def submit(job: Job, tgt: str) -> Result:
         progress.start_file(job.src)
+        r: Result | None = None
         try:
             r = execute_job(
                 job, tgt, args.mp3_quality, not args.no_verify,
                 lambda f: progress.update_file(job.src, f),
             )
+            return r
         finally:
-            progress.finish_file(job.src, job.size)
-        log.write(job.action, r.status, job.src, r.dst,
-                  job.size, r.bytes_out, r.note)
-        return r
+            succeeded = r is not None and r.status != "failed"
+            progress.finish_file(job.src, job.size, succeeded)
+            if r is not None:
+                log.write(job.action, r.status, job.src, r.dst,
+                          job.size, r.bytes_out, r.note)
 
     if len(runnable) == 0:
         print("Nothing to do.")
