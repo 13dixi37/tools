@@ -6,19 +6,29 @@ import queue
 import subprocess
 import threading
 from collections import defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from typing import Iterator, Optional, Protocol
 
 from .scan import HAS_FFPLAY
 from .track import Track
-from .ui import UI, human_bitrate, human_duration, human_size
+from .ui import (
+    UI,
+    human_bitrate_compact,
+    human_date,
+    human_duration,
+    human_size,
+)
 
 try:
+    from rich.markup import escape as _esc
     from rich.panel import Panel
     from rich.table import Table
     from rich.text import Text
 except ImportError:  # pragma: no cover
     Panel = Table = Text = None  # type: ignore[assignment,misc]
+
+    def _esc(s: str) -> str:  # type: ignore[misc]
+        return s
 
 
 GROUP_LABELS = {
@@ -26,6 +36,19 @@ GROUP_LABELS = {
     "audio": "Same audio content (different encoding/bitrate/format)",
     "meta": "Same artist & title (possibly different versions/remixes)",
 }
+
+
+@dataclass
+class ReviewedGroup:
+    kind: str
+    group: list[Track]
+    marks: dict[int, str] = field(default_factory=dict)  # index -> "keep"|"delete"
+
+
+@dataclass
+class ReviewResult:
+    reviewed: list[ReviewedGroup] = field(default_factory=list)
+    to_delete: list[Track] = field(default_factory=list)
 
 HELP_TEXT = """\
 Commands
@@ -170,16 +193,8 @@ def render_group(
 
     if ui.rich and Table is not None:
         assert ui.console is not None
-        ui.console.rule(f"[bold cyan]{header}[/bold cyan]")
-        table = Table(show_header=True, header_style="bold", box=None, pad_edge=False)
-        table.add_column("#", justify="right", style="dim", width=3)
-        table.add_column("", width=3)
-        table.add_column("File", overflow="fold")
-        table.add_column("Fmt", width=6)
-        table.add_column("Bitrate", justify="right", width=12)
-        table.add_column("SR", justify="right", width=7)
-        table.add_column("Len", justify="right", width=8)
-        table.add_column("Size", justify="right", width=10)
+        ui.console.rule(f"[bold cyan]{_esc(header)}[/bold cyan]")
+        table = _new_decision_table()
         for i, t in enumerate(group, 1):
             li = i - 1
             mark = ""
@@ -190,29 +205,30 @@ def render_group(
                 mark, style = "✗", "red"
             elif li == best:
                 mark = "★"
-            name = Text(t.display_name)
+            name = Text(t.display_name, no_wrap=True, overflow="ellipsis")
             if style:
                 name.stylize(style)
-            subline = Text("  └ " + os.path.dirname(t.path), style="dim")
             table.add_row(
                 str(i),
                 Text(mark, style=style or ("yellow" if li == best else "")),
-                Text.assemble(name, "\n", subline),
+                name,
+                human_date(t.mtime),
                 t.ext.lstrip("."),
-                human_bitrate(t.bitrate, t.lossless),
-                f"{t.sample_rate/1000:.1f}k" if t.sample_rate else "?",
+                human_bitrate_compact(t.bitrate, t.lossless),
                 human_duration(t.duration),
                 human_size(t.size),
             )
         ui.console.print(table)
         meta = next((t for t in group if t.artist or t.title), None)
         if meta:
-            ui.console.print(
-                f"  [dim]tags:[/dim] "
-                f"[bold]{meta.artist or '?'}[/bold] — "
-                f"{meta.title or '?'}"
-                + (f"  [dim]({meta.album})[/dim]" if meta.album else "")
-            )
+            line = Text()
+            line.append("  tags: ", style="dim")
+            line.append(meta.artist or "?", style="bold")
+            line.append(" — ")
+            line.append(meta.title or "?")
+            if meta.album:
+                line.append(f"  ({meta.album})", style="dim")
+            ui.console.print(line)
         ui.console.print()
     else:
         print("=" * 72)
@@ -227,10 +243,12 @@ def render_group(
                 mark = "✗"
             elif li == best:
                 mark = "★"
-            print(f"[{i}] {mark} {t.display_name}")
-            print(f"     {t.ext.lstrip('.')}  {human_bitrate(t.bitrate, t.lossless)}  "
-                  f"{t.sample_rate}Hz  {human_duration(t.duration)}  {human_size(t.size)}")
-            print(f"     {t.path}")
+            print(
+                f"[{i:>2}] {mark} {t.display_name}  "
+                f"{human_date(t.mtime)}  {t.ext.lstrip('.'):<5}  "
+                f"{human_bitrate_compact(t.bitrate, t.lossless):>8}  "
+                f"{human_duration(t.duration)}  {human_size(t.size)}"
+            )
         print()
 
 
@@ -276,6 +294,171 @@ def pick_best(group: list[Track]) -> int:
     return best
 
 
+# --- final confirmation ------------------------------------------------------
+
+def _new_decision_table() -> "Table":
+    """Shared table schema for the review and confirmation screens."""
+    assert Table is not None
+    table = Table(
+        show_header=True, header_style="bold", box=None,
+        pad_edge=False, expand=True,
+    )
+    table.add_column("#", justify="right", style="dim", width=3, no_wrap=True)
+    table.add_column("", width=1, no_wrap=True)
+    table.add_column("File", overflow="ellipsis", no_wrap=True, ratio=1, min_width=16)
+    table.add_column("Date", justify="right", width=10, no_wrap=True)
+    table.add_column("Fmt", width=5, no_wrap=True)
+    table.add_column("Bitrate", justify="right", width=8, no_wrap=True)
+    table.add_column("Len", justify="right", width=7, no_wrap=True)
+    table.add_column("Size", justify="right", width=9, no_wrap=True)
+    return table
+
+
+def _build_decision_table(
+    tracks: list[Track],
+    marks_for: "dict[int, str] | None" = None,
+    *,
+    all_delete: bool = False,
+) -> "Table":
+    assert Table is not None and Text is not None
+    table = _new_decision_table()
+    for i, t in enumerate(tracks, 1):
+        li = i - 1
+        if all_delete:
+            action = "delete"
+        else:
+            action = (marks_for or {}).get(li, "keep")
+        if action == "delete":
+            mark, style = "✗", "red"
+        else:
+            mark, style = "✓", "green"
+        name = Text(t.display_name, no_wrap=True, overflow="ellipsis")
+        name.stylize(style)
+        table.add_row(
+            str(i),
+            Text(mark, style=style),
+            name,
+            human_date(t.mtime),
+            t.ext.lstrip("."),
+            human_bitrate_compact(t.bitrate, t.lossless),
+            human_duration(t.duration),
+            human_size(t.size),
+        )
+    return table
+
+
+def _plain_decision_block(
+    header: str,
+    tracks: list[Track],
+    marks_for: "dict[int, str] | None" = None,
+    *,
+    all_delete: bool = False,
+) -> None:
+    print("-" * 72)
+    print(header)
+    for i, t in enumerate(tracks, 1):
+        li = i - 1
+        action = "delete" if all_delete else (marks_for or {}).get(li, "keep")
+        mark = "✗" if action == "delete" else "✓"
+        print(
+            f"[{i:>2}] {mark} {t.display_name}  "
+            f"{human_date(t.mtime)}  {t.ext.lstrip('.'):<5}  "
+            f"{human_bitrate_compact(t.bitrate, t.lossless):>8}  "
+            f"{human_duration(t.duration)}  {human_size(t.size)}"
+        )
+
+
+def render_final_confirmation(
+    ui: UI,
+    result: ReviewResult,
+    *,
+    corrupted: list[Track] = (),
+) -> None:
+    """Show every group with full details before the delete prompt."""
+    delete_groups = [rg for rg in result.reviewed if any(
+        a == "delete" for a in rg.marks.values()
+    )]
+
+    total_delete_bytes = sum(t.size for t in result.to_delete)
+    total_delete_files = len(result.to_delete)
+    total_groups = len(delete_groups) + (1 if corrupted else 0)
+
+    header = (
+        f"{total_delete_files} file(s) marked for deletion — "
+        f"{human_size(total_delete_bytes)}"
+    )
+
+    if ui.rich and Table is not None and Text is not None:
+        assert ui.console is not None
+        ui.console.rule(f"[bold]Confirm deletions[/bold]")
+        ui.console.print(f"[bold]{_esc(header)}[/bold]\n")
+
+        if corrupted:
+            ui.console.print(
+                f"[bold red]Corrupted files[/bold red] "
+                f"[dim]({len(corrupted)} file(s))[/dim]"
+            )
+            ui.console.print(_build_decision_table(corrupted, all_delete=True))
+            reclaim = sum(t.size for t in corrupted)
+            ui.console.print(
+                f"  [dim]reclaim:[/dim] {human_size(reclaim)}  "
+                f"[dim]({len(corrupted)} of {len(corrupted)} files)[/dim]\n"
+            )
+
+        for i, rg in enumerate(delete_groups, 1):
+            del_count = sum(1 for a in rg.marks.values() if a == "delete")
+            label = GROUP_LABELS.get(rg.kind, rg.kind)
+            ui.console.print(
+                f"[dim]Group {i}/{total_groups} —[/dim] "
+                f"[bold cyan]{_esc(label)}[/bold cyan]"
+            )
+            ui.console.print(_build_decision_table(rg.group, rg.marks))
+            reclaim = sum(
+                rg.group[li].size for li, a in rg.marks.items()
+                if a == "delete" and 0 <= li < len(rg.group)
+            )
+            ui.console.print(
+                f"  [dim]reclaim:[/dim] {human_size(reclaim)}  "
+                f"[dim]({del_count} of {len(rg.group)} files)[/dim]\n"
+            )
+
+        ui.console.print(
+            f"[bold]Total reclaim:[/bold] {human_size(total_delete_bytes)}  "
+            f"across {total_delete_files} file(s) in "
+            f"{total_groups} group(s)."
+        )
+    else:
+        print("=" * 72)
+        print("Confirm deletions")
+        print(header)
+        print()
+        if corrupted:
+            _plain_decision_block(
+                f"Corrupted files ({len(corrupted)} file(s))",
+                corrupted, all_delete=True,
+            )
+            reclaim = sum(t.size for t in corrupted)
+            print(f"  reclaim: {human_size(reclaim)}  "
+                  f"({len(corrupted)} of {len(corrupted)} files)")
+            print()
+        for i, rg in enumerate(delete_groups, 1):
+            del_count = sum(1 for a in rg.marks.values() if a == "delete")
+            label = GROUP_LABELS.get(rg.kind, rg.kind)
+            _plain_decision_block(
+                f"Group {i}/{total_groups} — {label}",
+                rg.group, rg.marks,
+            )
+            reclaim = sum(
+                rg.group[li].size for li, a in rg.marks.items()
+                if a == "delete" and 0 <= li < len(rg.group)
+            )
+            print(f"  reclaim: {human_size(reclaim)}  "
+                  f"({del_count} of {len(rg.group)} files)")
+            print()
+        print(f"Total reclaim: {human_size(total_delete_bytes)}  "
+              f"across {total_delete_files} file(s) in {total_groups} group(s).")
+
+
 # --- snippet playback --------------------------------------------------------
 
 def play_snippet(ui: UI, path: str, start: int = 30, length: int = 15) -> None:
@@ -286,7 +469,7 @@ def play_snippet(ui: UI, path: str, start: int = 30, length: int = 15) -> None:
         ui.error(f"File not found: {path}")
         return
     ui.print(
-        f"[cyan]▶ Playing {os.path.basename(path)} "
+        f"[cyan]▶ Playing {_esc(os.path.basename(path))} "
         f"(from {start}s, {length}s)  — press q or Ctrl+C to stop[/cyan]"
     )
     cmd = [
@@ -324,10 +507,10 @@ def interactive_review(
     *,
     play_start: int,
     play_length: int,
-) -> list[Track]:
-    to_delete: list[Track] = []
+) -> ReviewResult:
     gidx = 0
     group_marks: dict[int, dict[int, str]] = defaultdict(dict)
+    seen_groups: dict[int, tuple[str, list[Track]]] = {}
 
     while True:
         current = source.get(gidx, timeout=0.1)
@@ -340,6 +523,7 @@ def interactive_review(
             if current is None:
                 break
         kind, group = current
+        seen_groups[gidx] = (kind, group)
         marks = group_marks[gidx]
         render_group(ui, kind, group, gidx + 1, source.total_known(), not source.finished(), marks)
 
@@ -411,13 +595,28 @@ def interactive_review(
 
         ui.warning(f"Unknown command: {cmd!r}. Type ? for help.")
 
-    # Collate deletions over what we've actually viewed.
-    for gi, marks in group_marks.items():
-        item = source.get(gi, timeout=0)
-        if item is None:
+    # Collate over what we've actually viewed, preserving group order.
+    reviewed: list[ReviewedGroup] = []
+    to_delete: list[Track] = []
+    seen_paths: set[str] = set()
+    for gi in sorted(group_marks):
+        marks = group_marks[gi]
+        if not marks:
             continue
-        _, group = item
+        cached = seen_groups.get(gi)
+        if cached is None:
+            item = source.get(gi, timeout=0)
+            if item is None:
+                continue
+            cached = item
+        kind, group = cached
+        reviewed.append(ReviewedGroup(kind=kind, group=group, marks=dict(marks)))
         for li, action in marks.items():
-            if action == "delete" and 0 <= li < len(group):
-                to_delete.append(group[li])
-    return to_delete
+            if action != "delete" or not (0 <= li < len(group)):
+                continue
+            t = group[li]
+            if t.path in seen_paths:
+                continue
+            seen_paths.add(t.path)
+            to_delete.append(t)
+    return ReviewResult(reviewed=reviewed, to_delete=to_delete)

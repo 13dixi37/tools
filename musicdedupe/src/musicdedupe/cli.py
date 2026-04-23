@@ -17,7 +17,9 @@ from .review import (
     GroupSource,
     ListGroupSource,
     QueueGroupSource,
+    ReviewResult,
     interactive_review,
+    render_final_confirmation,
 )
 from .delete import do_delete, show_corrupted
 from .scan import (
@@ -28,7 +30,7 @@ from .scan import (
     scan_file,
 )
 from .track import Track
-from .ui import HAS_TRASH, UI, human_size
+from .ui import HAS_TRASH, UI
 
 try:
     from rich.panel import Panel
@@ -292,7 +294,8 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         # Corrupted triage first.
         to_delete: list[Track] = []
-        to_delete.extend(show_corrupted(ui, corrupted))
+        corrupted_picks = show_corrupted(ui, corrupted)
+        to_delete.extend(corrupted_picks)
 
         source, grouping_thread, errors = _build_source(
             healthy,
@@ -310,15 +313,17 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.no_stream:
             _print_summary(ui, source)
 
+        review_result = ReviewResult()
         first = source.get(0, timeout=0.5)
         if first is None and source.finished():
             ui.success("No duplicate groups found.")
         else:
             ui.print("\nReviewing duplicate groups. Type ? for help at any prompt.\n")
-            to_delete.extend(interactive_review(
+            review_result = interactive_review(
                 ui, source,
                 play_start=args.play_start, play_length=args.play_length,
-            ))
+            )
+            to_delete.extend(review_result.to_delete)
 
         source.stop()
         if grouping_thread is not None:
@@ -338,10 +343,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             seen.add(t.path)
             unique.append(t)
 
-        total_size = sum(t.size for t in unique)
-        ui.rule(f"{len(unique)} file(s) marked for deletion — {human_size(total_size)}")
-        for t in unique:
-            ui.print(f"  [red]✗[/red] {t.path}")
+        render_final_confirmation(ui, review_result, corrupted=corrupted_picks)
 
         if args.dry_run:
             ui.warning("--dry-run: not deleting anything.")
