@@ -10,9 +10,14 @@ from .track import Track
 from .ui import UI, HAS_TRASH
 
 try:
+    from rich.markup import escape as _esc
     from rich.table import Table
+    from rich.text import Text
 except ImportError:  # pragma: no cover
-    Table = None  # type: ignore[assignment,misc]
+    Table = Text = None  # type: ignore[assignment,misc]
+
+    def _esc(s: str) -> str:  # type: ignore[misc]
+        return s
 
 try:
     from send2trash import send2trash  # type: ignore[import-not-found]
@@ -49,7 +54,7 @@ def do_delete(
                 os.remove(t.path)
             n += 1
         except Exception as e:  # noqa: BLE001
-            ui.error(f"FAILED to delete {t.path}: {e}")
+            ui.error(f"FAILED to delete {_esc(t.path)}: {e}")
     return n
 
 
@@ -66,7 +71,7 @@ def show_corrupted(ui: UI, bad: list[Track]) -> list[Track]:
         table.add_column("File", overflow="fold")
         table.add_column("Error", overflow="fold")
         for i, t in enumerate(bad, 1):
-            table.add_row(str(i), t.path, t.error or "?")
+            table.add_row(str(i), Text(t.path), Text(t.error or "?"))
         ui.console.print(table)
     else:
         print(header)

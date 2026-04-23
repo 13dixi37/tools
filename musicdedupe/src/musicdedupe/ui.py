@@ -61,6 +61,23 @@ def human_bitrate(kbps: int, lossless: bool) -> str:
     return f"{kbps:>4d} {tag}"
 
 
+def human_bitrate_compact(kbps: int, lossless: bool) -> str:
+    if lossless:
+        return "lossless"
+    if not kbps:
+        return "     ?"
+    return f"{kbps:>4d} k"
+
+
+def human_date(mtime: float) -> str:
+    if not mtime or mtime <= 0:
+        return "        ?"
+    try:
+        return time.strftime("%Y-%m-%d", time.localtime(mtime))
+    except (OSError, ValueError):
+        return "        ?"
+
+
 # --- progress wrappers -------------------------------------------------------
 
 class _PlainProgress:
