@@ -17,19 +17,35 @@ Byte-identical and same-audio groups are shown with an auto-pick option
 (keep best quality, delete the rest). Version/remix groups always
 require a manual decision — because a remix isn't really a duplicate.
 
+Requires Python 3.10+.
+
 ## Install
 
-**Python packages** (required):
+**Recommended** — install with pipx and pull in every optional dep:
+
+```
+pipx install "musicdedupe[all] @ file://$PWD"
+# then just:
+musicdedupe /path/to/music
+```
+
+`[all]` brings in `rich` (prettier output), `send2trash` (safe deletion),
+`xxhash` + `blake3` (fast hashing), and `rapidfuzz` (typo-tolerant
+metadata grouping). Each can also be installed individually via
+`[rich]`, `[trash]`, `[fast]`, `[fuzzy]`.
+
+**Dev install:**
+
+```
+pip install -e ".[all,dev]"
+pytest
+```
+
+**Running without installing:**
 
 ```
 pip install mutagen
-```
-
-**Recommended** (the tool degrades gracefully if any are missing, but
-you want all of these):
-
-```
-pip install rich send2trash
+python3 musicdedupe/musicdedupe.py /path/to/music
 ```
 
 **System tools:**
@@ -47,11 +63,13 @@ disabled.
 ## Usage
 
 ```
-python3 musicdedupe.py /path/to/music
+musicdedupe /path/to/music
 ```
 
-The tool scans once (cached, so subsequent runs are instant), then walks
-you through duplicate groups one at a time.
+The tool scans once (SQLite cache, so subsequent runs are instant), then
+streams duplicate groups to you as they are discovered. You can start
+reviewing the byte-identical matches while the fingerprint and metadata
+passes are still running in the background.
 
 **Commands at each group:**
 
@@ -84,26 +102,48 @@ Nothing is deleted until the very end — you get a full summary and a
 --skip CAT           Skip a category: identical / audio / meta
                      (repeatable)
 --cache PATH         Scan cache location
-                     (default: <music-dir>/.musicdedupe-cache.json)
+                     (default: <music-dir>/.musicdedupe-cache.db)
 --no-cache           Disable caching
 --workers N          Parallel scan workers (default: 4)
+--hash-workers N     Process-pool workers for hashing (default: CPU count)
+--hash-algo A        blake3 / xxhash / sha1 / auto (default: auto picks
+                     the fastest available)
+--no-stream          Compute every group before starting review
+--no-fuzzy           Disable Levenshtein metadata matching
+--no-rich            Force plain output even if rich is installed
 --play-start SEC     Preview offset into song (default: 30s)
 --play-length SEC    Preview length (default: 15s)
 --follow-symlinks    Follow symlinks while walking
 ```
 
+## Performance notes
+
+- Byte-identical detection is two-stage: first a cheap partial hash of
+  the first and last 1 MiB (inside each same-size bucket), then a full
+  hash only for files whose partial hashes collide. On large FLAC
+  libraries this short-circuits almost every comparison without reading
+  the full file.
+- Hashing runs in a process pool (GIL-free). Use `--hash-workers` to
+  tune.
+- The cache is SQLite (WAL mode). Updates are O(1) per file and there's
+  no full-file rewrite. A legacy `.musicdedupe-cache.json` is migrated
+  automatically on first run.
+- Fuzzy metadata grouping uses rapidfuzz when available and only merges
+  pairs within 2 seconds of duration, which catches "The Beatls" vs
+  "The Beatles" without collapsing genuinely distinct tracks.
+
 ## Recommended workflow
 
 1. **Dry run first** to see what it wants to do:
-   `python3 musicdedupe.py ~/Music --dry-run`
+   `musicdedupe ~/Music --dry-run`
 2. **Start with the obvious group:** only review byte-identical for now:
-   `python3 musicdedupe.py ~/Music --skip audio --skip meta`
+   `musicdedupe ~/Music --skip audio --skip meta`
    Tap `a` then Enter on each — pure auto-cleanup.
 3. **Second pass:** same-audio groups:
-   `python3 musicdedupe.py ~/Music --skip meta`
+   `musicdedupe ~/Music --skip meta`
    Use `p 1` / `p 2` to A/B if unsure between a FLAC and a high-bitrate MP3.
 4. **Third pass:** version/remix candidates:
-   `python3 musicdedupe.py ~/Music --skip identical --skip audio`
+   `musicdedupe ~/Music --skip identical --skip audio`
    These need your judgment — use `p` liberally.
 
 ## Safety
@@ -113,8 +153,8 @@ Nothing is deleted until the very end — you get a full summary and a
 - If `send2trash` isn't installed, it falls back to **moving** files into
   `./musicdedupe-removed/` — still recoverable.
 - Use `--delete-mode remove` only if you know what you're doing.
-- The scan cache lives at `<music-dir>/.musicdedupe-cache.json`.
-  Delete it to force a fresh scan.
+- The scan cache lives at `<music-dir>/.musicdedupe-cache.db`. Delete it
+  to force a fresh scan.
 
 ## How quality is scored
 

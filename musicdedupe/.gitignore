@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+build/
+dist/
+.musicdedupe-cache.db
+.musicdedupe-cache.json
+.musicdedupe-cache.json.migrated
