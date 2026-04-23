@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "musicdedupe"
+version = "0.2.0"
+description = "Interactive CLI to find and clean up duplicate music files."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "musicdedupe contributors" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = ["mutagen>=1.46"]
+
+[project.optional-dependencies]
+rich = ["rich>=13"]
+trash = ["send2trash>=1.8"]
+fast = ["xxhash>=3.4", "blake3>=0.4"]
+fuzzy = ["rapidfuzz>=3.6"]
+all = [
+    "rich>=13",
+    "send2trash>=1.8",
+    "xxhash>=3.4",
+    "blake3>=0.4",
+    "rapidfuzz>=3.6",
+]
+dev = [
+    "pytest>=8",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+musicdedupe = "musicdedupe.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/13dixi37/tools"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/musicdedupe"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/musicdedupe",
+    "tests",
+    "README.md",
+    "pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+# Prepend src/ so `import musicdedupe` resolves to the package rather than
+# the backwards-compat `musicdedupe.py` shim at the repo root.
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.10"
+strict_optional = true
+warn_redundant_casts = true
+packages = ["musicdedupe"]
+mypy_path = "src"
+# Optional deps may or may not be installed at type-check time; letting
+# `warn_unused_ignores` fire would flip-flop error counts by environment.
+warn_unused_ignores = false
+
+[[tool.mypy.overrides]]
+module = ["mutagen", "rich.*", "rapidfuzz", "rapidfuzz.*", "xxhash", "blake3", "send2trash"]
+ignore_missing_imports = true
